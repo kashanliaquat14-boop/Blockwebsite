@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cosmic Hand Control Prototype</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* HUD Overlay */
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            color: rgba(255, 255, 255, 0.9);
+            pointer-events: none;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            text-shadow: 0 0 10px #00d2ff;
+        }
+
+        .status-box {
+            margin-top: 15px;
+            background: rgba(0, 20, 40, 0.6);
+            border: 1px solid rgba(0, 210, 255, 0.3);
+            padding: 15px;
+            border-radius: 8px;
+            backdrop-filter: blur(5px);
+            max-width: 300px;
+        }
+
+        .gesture-indicator {
+            font-weight: bold;
+            font-size: 1.2rem;
+            color: #00ffcc;
+            margin-bottom: 5px;
+        }
+
+        .instruction-list {
+            font-size: 0.85rem;
+            line-height: 1.6;
+            color: #ccc;
+            list-style: none;
+            padding: 0;
+        }
+
+        .instruction-list li::before {
+            content: "• ";
+            color: #00d2ff;
+        }
+
+        /* Webcam Preview (Small, flipped) */
+        #webcam-preview {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 240px;
+            height: 180px;
+            border-radius: 12px;
+            border: 2px solid rgba(255, 255, 255, 0.2);
+            z-index: 10;
+            transform: scaleX(-1); /* Mirror effect */
+            object-fit: cover;
+            opacity: 0.8;
+        }
+
+        /* Loading Screen */
+        #loader {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #050510;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 999;
+            color: white;
+            transition: opacity 0.5s;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 5px solid rgba(255, 255, 255, 0.1);
+            border-top: 5px solid #00d2ff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-bottom: 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        #cursor {
+            position: absolute;
+            width: 20px;
+            height: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.8);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            z-index: 5;
+            display: none; /* Controlled by JS */
+            box-shadow: 0 0 10px #ffffff;
+        }
+    </style>
+
+    <!-- Import Map for Modules -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/+esm"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <!-- Loading Screen -->
+    <div id="loader">
+        <div class="spinner"></div>
+        <div id="loader-text">Initializing AI Vision...</div>
+    </div>
+
+    <!-- UI Overlay -->
+    <div id="hud">
+        <h1>Cosmic Hands</h1>
+        <div class="status-box">
+            <div id="current-gesture" class="gesture-indicator">Detecting Hand...</div>
+            <ul class="instruction-list">
+                <li>🖐️ <b>Open Palm:</b> Hover/Select</li>
+                <li>👌 <b>Pinch:</b> Grab & Drag</li>
+                <li>✊ <b>Fist:</b> Explode Block</li>
+                <li>👍 <b>Thumbs Up:</b> Duplicate Block</li>
+                <li>👋 <b>Wave:</b> Pan Camera</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- Visual Cursor for Hand Position -->
+    <div id="cursor"></div>
+
+    <!-- Webcam Video (Hidden from main view, shown in corner) -->
+    <video id="webcam-preview" autoplay playsinline></video>
+
+    <!-- 3D Canvas -->
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+
+        // --- Configuration ---
+        const CONFIG = {
+            blockCount: 15,
+            colors: [0x4cc9f0, 0x4361ee, 0x7209b7, 0xf72585, 0x00f5d4],
+            cameraSpeed: 0.1,
+            dragSmoothness: 0.2
+        };
+
+        // --- Global State ---
+        const state = {
+            gesture: 'None',
+            handPosition: { x: 0, y: 0 }, // Normalized 0-1
+            isPinching: false,
+            isFist: false,
+            isThumbsUp: false,
+            lastHandX: 0.5, // For panning
+            cameraTargetX: 0
+        };
+
+        // --- Three.js Globals ---
+        let scene, camera, renderer;
+        let blocks = [];
+        let particles = [];
+        let raycaster, mouseVector;
+        let selectedBlock = null;
+        let draggedBlock = null;
+        let starField;
+
+        // --- HTML Elements ---
+        const videoElement = document.getElementById('webcam-preview');
+        const loader = document.getElementById('loader');
+        const loaderText = document.getElementById('loader-text');
+        const gestureText = document.getElementById('current-gesture');
+        const cursorEl = document.getElementById('cursor');
+
+        // ==========================================
+        // 1. INITIALIZATION & SETUP
+        // ==========================================
+
+        async function init() {
+            // Setup 3D Scene
+            initThreeJS();
+            
+            // Setup MediaPipe
+            try {
+                await initHandTracking();
+                loader.style.opacity = '0';
+                setTimeout(() => loader.style.display = 'none', 500);
+            } catch (err) {
+                loaderText.innerText = "Error accessing webcam or loading AI.";
+                console.error(err);
+            }
+
+            // Start Loop
+            animate();
+        }
+
+        function initThreeJS() {
+            const container = document.getElementById('canvas-container');
+
+            // Scene
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x050510, 0.02);
+            scene.background = new THREE.Color(0x050510);
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 0, 10);
+
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            container.appendChild(renderer.domElement);
+
+            // Lights
+            const ambientLight = new THREE.AmbientLight(0x404040, 2);
+            scene.add(ambientLight);
+
+            const dirLight = new THREE.DirectionalLight(0xffffff, 2);
+            dirLight.position.set(5, 10, 7);
+            scene.add(dirLight);
+
+            const pointLight = new THREE.PointLight(0x00d2ff, 5, 50);
+            pointLight.position.set(0, 0, 5);
+            scene.add(pointLight);
+
+            // Objects
+            createStars();
+            createBlocks();
+
+            // Interaction Tools
+            raycaster = new THREE.Raycaster();
+            mouseVector = new THREE.Vector2();
+
+            // Resize Handler
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function createStars() {
+            const geometry = new THREE.BufferGeometry();
+            const vertices = [];
+            for (let i = 0; i < 2000; i++) {
+                vertices.push(
+                    THREE.MathUtils.randFloatSpread(100),
+                    THREE.MathUtils.randFloatSpread(100),
+                    THREE.MathUtils.randFloatSpread(50) - 20
+                );
+            }
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+            const material = new THREE.PointsMaterial({ color: 0xffffff, size: 0.1, transparent: true, opacity: 0.8 });
+            starField = new THREE.Points(geometry, material);
+            scene.add(starField);
+        }
+
+        function createBlocks() {
+            const geometry = new THREE.BoxGeometry(1, 1, 1);
+            // Chamfer box edges slightly for better lighting (visual hack using geometry modifiers or just smooth shading)
+            
+            for (let i = 0; i < CONFIG.blockCount; i++) {
+                addBlock(geometry);
+            }
+        }
+
+        function addBlock(geometry, position = null) {
+            const color = CONFIG.colors[Math.floor(Math.random() * CONFIG.colors.length)];
+            
+            // Iridescent Material
+            const material = new THREE.MeshPhysicalMaterial({
+                color: color,
+                metalness: 0.1,
+                roughness: 0.1,
+                transmission: 0.6, // Glass-like
+                thickness: 1.5,
+                iridescence: 1,
+                iridescenceIOR: 1.3,
+                clearcoat: 1.0,
+                clearcoatRoughness: 0.1
+            });
+
+            const mesh = new THREE.Mesh(geometry || new THREE.BoxGeometry(1,1,1), material);
+
+            if (position) {
+                mesh.position.copy(position);
+                // Offset slightly to avoid z-fighting on duplicate
+                mesh.position.x += 0.5; 
+                mesh.position.y += 0.5;
+            } else {
+                mesh.position.x = THREE.MathUtils.randFloatSpread(12);
+                mesh.position.y = THREE.MathUtils.randFloatSpread(8);
+                mesh.position.z = THREE.MathUtils.randFloatSpread(5);
+            }
+
+            mesh.rotation.x = Math.random() * Math.PI;
+            mesh.rotation.y = Math.random() * Math.PI;
+            
+            // Custom properties for physics simulation
+            mesh.userData = {
+                floatSpeed: 0.005 + Math.random() * 0.01,
+                floatOffset: Math.random() * Math.PI * 2,
+                rotationSpeed: { x: (Math.random()-0.5)*0.01, y: (Math.random()-0.5)*0.01 },
+                originalScale: 1
+            };
+
+            scene.add(mesh);
+            blocks.push(mesh);
+            return mesh;
+        }
+
+        function createExplosion(position, color) {
+            const particleCount = 30;
+            const geometry = new THREE.BufferGeometry();
+            const positions = [];
+            const velocities = [];
+
+            for(let i=0; i<particleCount; i++) {
+                positions.push(position.x, position.y, position.z);
+                velocities.push(
+                    (Math.random() - 0.5) * 0.5,
+                    (Math.random() - 0.5) * 0.5,
+                    (Math.random() - 0.5) * 0.5
+                );
+            }
+
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            
+            const material = new THREE.PointsMaterial({
+                color: color,
+                size: 0.3,
+                transparent: true,
+                opacity: 1,
+                blending: THREE.AdditiveBlending
+            });
+
+            const particleSystem = new THREE.Points(geometry, material);
+            particleSystem.userData = { velocities: velocities, life: 1.0 };
+            
+            scene.add(particleSystem);
+            particles.push(particleSystem);
+        }
+
+        // ==========================================
+        // 2. HAND TRACKING (MediaPipe)
+        // ==========================================
+
+        let handLandmarker;
+        let lastVideoTime = -1;
+
+        async function initHandTracking() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+            );
+
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
+
+            // Get Webcam Stream
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            videoElement.srcObject = stream;
+            
+            return new Promise((resolve) => {
+                videoElement.addEventListener("loadeddata", resolve);
+            });
+        }
+
+        function detectHands() {
+            if (!handLandmarker || !videoElement.videoWidth) return;
+
+            let startTimeMs = performance.now();
+            if (videoElement.currentTime !== lastVideoTime) {
+                lastVideoTime = videoElement.currentTime;
+                const results = handLandmarker.detectForVideo(videoElement, startTimeMs);
+
+                if (results.landmarks && results.landmarks.length > 0) {
+                    processGestures(results.landmarks[0], results.handednesses[0]);
+                } else {
+                    state.gesture = "Searching...";
+                    cursorEl.style.display = 'none';
+                    state.isPinching = false;
+                    draggedBlock = null;
+                }
+            }
+        }
+
+        // ==========================================
+        // 3. GESTURE LOGIC
+        // ==========================================
+
+        function processGestures(landmarks, handedness) {
+            // MediaPipe Coords: x (0-1), y (0-1), z. 
+            // 0,0 is Top-Left. 
+            // Handedness is flipped in webcam usually, but we check.
+            
+            // 1. Update Cursor Position (Index Finger Tip: #8)
+            const indexTip = landmarks[8];
+            // Mirror X because webcam is mirrored
+            state.handPosition.x = (1 - indexTip.x) * 2 - 1; // Range -1 to 1
+            state.handPosition.y = -(indexTip.y * 2 - 1); // Range -1 to 1 (inverted Y)
+
+            // Update DOM Cursor
+            cursorEl.style.display = 'block';
+            cursorEl.style.left = `${(1 - indexTip.x) * 100}%`;
+            cursorEl.style.top = `${indexTip.y * 100}%`;
+
+            // 2. Calculate Distances for Gestures
+            const thumbTip = landmarks[4];
+            const middleTip = landmarks[12];
+            const ringTip = landmarks[16];
+            const pinkyTip = landmarks[20];
+            const wrist = landmarks[0];
+
+            // Helper: distance between two 3D points
+            const dist = (p1, p2) => Math.sqrt(
+                Math.pow(p1.x - p2.x, 2) + 
+                Math.pow(p1.y - p2.y, 2) + 
+                Math.pow(p1.z - p2.z, 2)
+            );
+
+            const pinchDist = dist(thumbTip, indexTip);
+            const isFist = (dist(indexTip, wrist) < 0.15 && dist(middleTip, wrist) < 0.15 && dist(pinkyTip, wrist) < 0.15);
+            
+            // Thumbs Up Check: Thumb extended (far from index base), others curled
+            const indexBase = landmarks[5];
+            const isThumbExtended = dist(thumbTip, indexBase) > 0.15;
+            const areOthersCurled = dist(indexTip, wrist) < 0.2 && dist(middleTip, wrist) < 0.2;
+            const isThumbsUp = isThumbExtended && areOthersCurled;
+
+            // Camera Panning (Wave)
+            // If hand is moving fast horizontally? 
+            // Simplify: If hand is on edge of screen (left 10% or right 10%)
+            const handX = 1 - indexTip.x; // 0 to 1
+            if (handX < 0.1) state.cameraTargetX += 0.1;
+            else if (handX > 0.9) state.cameraTargetX -= 0.1;
+
+            // --- State Machine ---
+            
+            // Reset One-Shot Triggers
+            state.isThumbsUp = false;
+
+            if (isFist) {
+                state.gesture = "FIST (Explode)";
+                state.isFist = true;
+                state.isPinching = false;
+            } else if (pinchDist < 0.05) { // Threshold for pinch
+                state.gesture = "PINCH (Grab)";
+                state.isPinching = true;
+                state.isFist = false;
+            } else if (isThumbsUp) {
+                state.gesture = "THUMBS UP (Copy)";
+                state.isThumbsUp = true;
+                state.isPinching = false;
+                state.isFist = false;
+            } else {
+                state.gesture = "OPEN PALM (Select)";
+                state.isPinching = false;
+                state.isFist = false;
+            }
+
+            gestureText.innerText = state.gesture;
+            
+            // Pass orientation for rotation
+            // Calculate roll angle of hand
+            state.handRotation = Math.atan2(indexBase.y - landmarks[17].y, indexBase.x - landmarks[17].x);
+        }
+
+
+        // ==========================================
+        // 4. MAIN LOOP & INTERACTION
+        // ==========================================
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            // Run Detection
+            detectHands();
+
+            // 1. Update Raycaster based on Hand Position
+            mouseVector.set(state.handPosition.x, state.handPosition.y);
+            raycaster.setFromCamera(mouseVector, camera);
+
+            // 2. Interact with Objects
+            const intersects = raycaster.intersectObjects(blocks);
+            
+            // Reset highlights
+            if (!draggedBlock) {
+                blocks.forEach(b => {
+                    b.material.emissive.setHex(0x000000);
+                    b.scale.setScalar(THREE.MathUtils.lerp(b.scale.x, b.userData.originalScale, 0.1));
+                });
+                selectedBlock = null;
+            }
+
+            // Hover Logic
+            if (intersects.length > 0 && !draggedBlock) {
+                const hit = intersects[0].object;
+                selectedBlock = hit;
+                
+                // Highlight
+                hit.material.emissive.setHex(0x333333);
+                hit.scale.setScalar(THREE.MathUtils.lerp(hit.scale.x, 1.2, 0.1));
+
+                // Actions while hovering
+                if (state.isFist) {
+                    // Explode
+                    createExplosion(hit.position, hit.material.color);
+                    scene.remove(hit);
+                    blocks = blocks.filter(b => b !== hit);
+                    selectedBlock = null;
+                } else if (state.isThumbsUp) {
+                    // Duplicate (Debounced by logic flow, simpler here)
+                    // We need a cooldown to prevent 60 duplicates per second
+                    if (!hit.userData.lastDupTime || Date.now() - hit.userData.lastDupTime > 1000) {
+                        addBlock(hit.geometry, hit.position);
+                        hit.userData.lastDupTime = Date.now();
+                        // Flash effect
+                        hit.material.emissive.setHex(0xffffff);
+                    }
+                }
+            }
+
+            // Drag Logic
+            if (state.isPinching) {
+                if (selectedBlock && !draggedBlock) {
+                    draggedBlock = selectedBlock;
+                }
+            } else {
+                draggedBlock = null;
+            }
+
+            if (draggedBlock) {
+                // Move object to ray intersection at a fixed distance (e.g., 5 units from camera)
+                // We create a virtual plane at the object's depth
+                const distance = camera.position.z - draggedBlock.position.z;
+                const targetPos = new THREE.Vector3();
+                
+                // Unproject mouse vector to world space at specific Z depth logic
+                // Simplified: Just map x/y directly to frustum size at depth 0
+                // A better way for 3D dragging:
+                const vec = new THREE.Vector3(state.handPosition.x, state.handPosition.y, 0.5);
+                vec.unproject(camera);
+                const dir = vec.sub(camera.position).normalize();
+                const dist = (0 - camera.position.z) / dir.z; // Project to Z=0 plane
+                const pos = camera.position.clone().add(dir.multiplyScalar(dist));
+                
+                // Lerp for smooth drag
+                draggedBlock.position.lerp(pos, CONFIG.dragSmoothness);
+
+                // Rotation interaction
+                draggedBlock.rotation.z = state.handRotation;
+                draggedBlock.material.emissive.setHex(0x555555);
+            }
+
+            // 3. Physics & Animation Updates
+            const time = Date.now() * 0.001;
+            
+            // Idle Floating
+            blocks.forEach(b => {
+                if (b !== draggedBlock) {
+                    b.position.y += Math.sin(time + b.userData.floatOffset) * b.userData.floatSpeed;
+                    b.rotation.x += b.userData.rotationSpeed.x;
+                    b.rotation.y += b.userData.rotationSpeed.y;
+                }
+            });
+
+            // Particles
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.userData.life -= 0.02;
+                const positions = p.geometry.attributes.position.array;
+                const vels = p.userData.velocities;
+                
+                for(let j=0; j < positions.length; j+=3) {
+                    positions[j] += vels[j];
+                    positions[j+1] += vels[j+1];
+                    positions[j+2] += vels[j+2];
+                }
+                p.geometry.attributes.position.needsUpdate = true;
+                p.material.opacity = p.userData.life;
+
+                if (p.userData.life <= 0) {
+                    scene.remove(p);
+                    particles.splice(i, 1);
+                }
+            }
+
+            // Camera Panning
+            camera.position.x += (state.cameraTargetX - camera.position.x) * 0.05;
+            camera.lookAt(state.cameraTargetX, 0, 0);
+
+            // Render
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // Start
+        init();
+
+    </script>
+</body>
+</html>
